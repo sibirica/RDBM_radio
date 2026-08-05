@@ -99,6 +99,12 @@ parser.add_argument(
     help="Accelerate mixed precision dtype when --amp=1",
 )
 parser.add_argument("--compile", type=int, default=1, help="torch.compile the UNet (1/0)")
+parser.add_argument(
+    "--resume",
+    type=str,
+    default="auto",
+    help="Resume checkpoint: 'auto' (latest model-*/model-*.pt), 'none', or a step number",
+)
 parser.add_argument("--use_wandb", type=int, default=1, help="Enable wandb logging (1/0)")
 parser.add_argument("--wandb_project", type=str, default="radio", help="wandb project / workspace name")
 parser.add_argument("--wandb_entity", type=str, default=None, help="wandb entity (optional)")
@@ -121,8 +127,37 @@ def divisible_by(numer, denom):
 
 
 def create_folder(folder_path):
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
+    os.makedirs(folder_path, exist_ok=True)
+
+
+def find_latest_checkpoint_step(results_folder):
+    """Return the largest step with model-{step}/model-{step}.pt, or None."""
+    if not os.path.isdir(results_folder):
+        return None
+    best = None
+    for name in os.listdir(results_folder):
+        if not name.startswith("model-"):
+            continue
+        try:
+            step = int(name.split("-", 1)[1])
+        except ValueError:
+            continue
+        pt_path = os.path.join(results_folder, name, f"{name}.pt")
+        if os.path.isfile(pt_path) and (best is None or step > best):
+            best = step
+    return best
+
+
+def resolve_resume_step(results_folder, resume):
+    """Parse --resume into a checkpoint step, or None to start fresh."""
+    if resume is None:
+        return None
+    text = str(resume).strip().lower()
+    if text in ("none", "no", "false", "0"):
+        return None
+    if text == "auto":
+        return find_latest_checkpoint_step(results_folder)
+    return int(resume)
 
 
 def create_empty_json(json_path):
@@ -421,15 +456,17 @@ class Trainer(object):
             'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
         }
         checkpoint_save_path = os.path.join(self.results_folder, f'model-{milestone}')
-        if not os.path.exists(checkpoint_save_path):
-            os.makedirs(checkpoint_save_path)
+        os.makedirs(checkpoint_save_path, exist_ok=True)
         torch.save(data, checkpoint_save_path + '/' + f'model-{milestone}.pt')
 
     def load(self, milestone=None):
         accelerator = self.accelerator
         device = accelerator.device
         checkpoint_save_path = os.path.join(self.results_folder, f'model-{milestone}')
-        data = torch.load(str(checkpoint_save_path + '/' + f'model-{milestone}.pt'), map_location=device)
+        ckpt_path = os.path.join(checkpoint_save_path, f'model-{milestone}.pt')
+        if accelerator.is_main_process:
+            accelerator.print(f'Loading checkpoint: {ckpt_path}')
+        data = torch.load(ckpt_path, map_location=device, weights_only=False)
         rdbm = self._unwrap_rdbm()
         rdbm.load_state_dict(self._align_state_dict_to_module(data['model'], rdbm))
         self.step = data['step'] + 1
@@ -439,6 +476,8 @@ class Trainer(object):
             self.accelerator.scaler.load_state_dict(data['scaler'])
         if self.scheduler is not None and data.get('scheduler') is not None:
             self.scheduler.load_state_dict(data['scheduler'])
+        if accelerator.is_main_process:
+            accelerator.print(f'Resumed at step {self.step}')
 
     def cal_psnr(self, img_ref, img_gen, data_range=255.0):
         mse = np.mean((img_ref.astype(np.float32) / data_range - img_gen.astype(np.float32) / data_range) ** 2)
@@ -690,7 +729,16 @@ def init_wandb(args, results_folder):
         print("Warning: --use_wandb=1 but wandb is not installed; skipping.")
         return False
 
-    run_id = args.wandb_id or wandb.util.generate_id()
+    wandb_id_path = os.path.join(results_folder, "wandb_id.txt")
+    if args.wandb_id:
+        run_id = args.wandb_id
+    elif os.path.isfile(wandb_id_path):
+        with open(wandb_id_path, "r", encoding="utf-8") as f:
+            run_id = f.read().strip()
+    else:
+        run_id = wandb.util.generate_id()
+        with open(wandb_id_path, "w", encoding="utf-8") as f:
+            f.write(run_id + "\n")
     run_name = args.wandb_name or args.exp_id
     init_kwargs = dict(
         project=args.wandb_project,
@@ -817,6 +865,13 @@ def train_ddp_accelerate(args):
     )
     if RDBM_Trainer.use_wandb:
         RDBM_Trainer.use_wandb = init_wandb(args, results_folder)
+
+    resume_step = resolve_resume_step(results_folder, args.resume)
+    if resume_step is not None:
+        RDBM_Trainer.load(resume_step)
+    elif RDBM_Trainer.accelerator.is_main_process:
+        print(f"No checkpoint to resume (resume={args.resume!r}); starting from step 0")
+
     RDBM_Trainer.train()
     print('Procedure Termination: (Finished)')
 

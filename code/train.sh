@@ -5,10 +5,13 @@
 set -euo pipefail
 
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+# Optional: set CUDA_VISIBLE_DEVICES to restrict GPUs (e.g. CUDA_VISIBLE_DEVICES=0,1).
+# If unset, all devices visible to the process are used.
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES
+fi
 
 expid="${expid:-radio_2}"
-nproc="${nproc:-4}"
 # radiography/ sits next to RDBM_radio/ under $HOME
 dataset_json="${dataset_json:-../../radiography/fix_test_realistic_v2/dataset.json}"
 optim="${optim:-muon}"
@@ -20,6 +23,16 @@ amp="${amp:-1}"
 mixed_precision="${mixed_precision:-bf16}"
 compile="${compile:-1}"
 save_and_sample_every="${save_and_sample_every:-1000}"
+resume="${resume:-auto}"
+
+# Auto-detect process count from visible CUDA devices unless nproc is set.
+if [[ -z "${nproc:-}" ]]; then
+  nproc="$(python - <<'PY'
+import torch
+print(max(torch.cuda.device_count(), 1))
+PY
+)"
+fi
 
 # Defaults depend on optimizer; override via env if desired
 if [[ "${optim}" == "adam" ]]; then
@@ -31,7 +44,7 @@ wd="${wd:-0.1}"
 
 echo "expid=${expid}"
 echo "dataset_json=${dataset_json}"
-echo "nproc=${nproc} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "nproc=${nproc} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}"
 # Cosine LR is the default for muon, with 10% linear warmup then cosine decay.
 # Override with lr_scheduler=none|cosine|... and/or warmup_ratio=0.05 etc.
 lr_scheduler="${lr_scheduler:-}"
@@ -42,7 +55,7 @@ echo "use_wandb=${use_wandb} wandb_project=${wandb_project}"
 echo "lr_scheduler=${lr_scheduler:-cosine(default for muon)} warmup_ratio=${warmup_ratio:-0.1(default for muon)}"
 echo "attn_heads=${attn_heads} attn_dim_head=${attn_dim_head}"
 echo "amp=${amp} mixed_precision=${mixed_precision} compile=${compile}"
-echo "save_and_sample_every=${save_and_sample_every}"
+echo "save_and_sample_every=${save_and_sample_every} resume=${resume}"
 
 torchrun --standalone --nnodes 1 --nproc_per_node "${nproc}" train.py \
   --exp_id="${expid}" \
@@ -63,6 +76,7 @@ torchrun --standalone --nnodes 1 --nproc_per_node "${nproc}" train.py \
   --amp "${amp}" \
   --mixed_precision "${mixed_precision}" \
   --compile "${compile}" \
+  --resume "${resume}" \
   --results_folder ./save_folder \
   --use_wandb "${use_wandb}" \
   --wandb_project "${wandb_project}"
