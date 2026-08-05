@@ -1,12 +1,68 @@
+#!/usr/bin/env bash
+# Train RDBM on the radiography (radio) dataset.
+# Run from RDBM_radio/code/
+# Optimizers: optim=muon (default) or optim=adam
+set -euo pipefail
+
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
-start_time=$(date +%s)
-echo "start_time: ${start_time}"
+expid="${expid:-radio_2}"
+nproc="${nproc:-4}"
+# radiography/ sits next to RDBM_radio/ under $HOME
+dataset_json="${dataset_json:-../../radiography/fix_test_realistic_v2/dataset.json}"
+optim="${optim:-muon}"
+use_wandb="${use_wandb:-1}"
+wandb_project="${wandb_project:-radio}"
+attn_heads="${attn_heads:-4}"
+attn_dim_head="${attn_dim_head:-16}"
+amp="${amp:-1}"
+mixed_precision="${mixed_precision:-bf16}"
+compile="${compile:-1}"
+save_and_sample_every="${save_and_sample_every:-1000}"
 
-nohup python -m torch.distributed.launch --nproc_per_node 8 --use-env train.py  > ./train.log 2>&1 & 
- 
-end_time=$(date +%s)
-e2e_time=$(($end_time - $start_time))
- 
-echo "------------------ Final result ------------------"
+# Defaults depend on optimizer; override via env if desired
+if [[ "${optim}" == "adam" ]]; then
+  lr="${lr:-8e-5}"
+else
+  lr="${lr:-1e-3}"
+fi
+wd="${wd:-0.1}"
+
+echo "expid=${expid}"
+echo "dataset_json=${dataset_json}"
+echo "nproc=${nproc} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+# Cosine LR is the default for muon, with 10% linear warmup then cosine decay.
+# Override with lr_scheduler=none|cosine|... and/or warmup_ratio=0.05 etc.
+lr_scheduler="${lr_scheduler:-}"
+warmup_ratio="${warmup_ratio:-}"
+
+echo "optim=${optim} lr=${lr} wd=${wd}"
+echo "use_wandb=${use_wandb} wandb_project=${wandb_project}"
+echo "lr_scheduler=${lr_scheduler:-cosine(default for muon)} warmup_ratio=${warmup_ratio:-0.1(default for muon)}"
+echo "attn_heads=${attn_heads} attn_dim_head=${attn_dim_head}"
+echo "amp=${amp} mixed_precision=${mixed_precision} compile=${compile}"
+echo "save_and_sample_every=${save_and_sample_every}"
+
+torchrun --standalone --nnodes 1 --nproc_per_node "${nproc}" train.py \
+  --exp_id="${expid}" \
+  --dataset_json="${dataset_json}" \
+  --channels 1 \
+  --attn_heads "${attn_heads}" \
+  --attn_dim_head "${attn_dim_head}" \
+  --crop_size 256 \
+  --patch_size 256 \
+  --optim "${optim}" \
+  --lr "${lr}" \
+  --wd "${wd}" \
+  ${lr_scheduler:+--lr_scheduler "${lr_scheduler}"} \
+  ${warmup_ratio:+--warmup_ratio "${warmup_ratio}"} \
+  --train_batch_size 16 \
+  --train_num_steps 10001 \
+  --save_and_sample_every "${save_and_sample_every}" \
+  --amp "${amp}" \
+  --mixed_precision "${mixed_precision}" \
+  --compile "${compile}" \
+  --results_folder ./save_folder \
+  --use_wandb "${use_wandb}" \
+  --wandb_project "${wandb_project}"

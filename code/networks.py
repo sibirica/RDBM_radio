@@ -4,11 +4,7 @@ from functools import partial
 import torch
 from torch import einsum, nn
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
- 
 
 def exists(x):
     return x is not None
@@ -54,24 +50,27 @@ class WeightStandardizedConv2d(nn.Conv2d):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
 
         weight = self.weight
-        mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
-        var = reduce(weight, 'o ... -> o 1 1 1',
-                     partial(torch.var, unbiased=False))
+        mean = weight.mean(dim=(1, 2, 3), keepdim=True)
+        var = weight.var(dim=(1, 2, 3), unbiased=False, keepdim=True)
         normalized_weight = (weight - mean) * (var + eps).rsqrt()
 
-        return F.conv2d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        return F.conv2d(
+            x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups
+        )
 
 
 class LayerNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        # Channel vector (not NCHW) so torch.compile backward does not choke on
+        # broadcast gradients of shape [C] vs [1, C, 1, 1].
+        self.g = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
         var = torch.var(x, dim=1, unbiased=False, keepdim=True)
         mean = torch.mean(x, dim=1, keepdim=True)
-        return (x - mean) * (var + eps).rsqrt() * self.g
+        return (x - mean) * (var + eps).rsqrt() * self.g[None, :, None, None]
 
 
 class PreNorm(nn.Module):
@@ -96,8 +95,9 @@ class SinusoidalPosEmb(nn.Module):
         device = x.device
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        # Match input dtype so AMP/bf16 does not mix float32 freqs with bf16 x.
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=x.dtype) * -emb)
+        emb = x[:, None].to(dtype=emb.dtype) * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -114,8 +114,8 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
             half_dim), requires_grad=not is_random)
 
     def forward(self, x):
-        x = rearrange(x, 'b -> b 1')
-        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
+        x = x[:, None]
+        freqs = x * self.weights[None, :] * 2 * math.pi
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         fouriered = torch.cat((x, fouriered), dim=-1)
         return fouriered
@@ -160,7 +160,7 @@ class ResnetBlock(nn.Module):
         scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
+            time_emb = time_emb[:, :, None, None]
             scale_shift = time_emb.chunk(2, dim=1)
 
         h = self.block1(x, scale_shift=scale_shift)
@@ -186,8 +186,7 @@ class LinearAttention(nn.Module):
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(
-            t, 'b (h c) x y -> b h c (x y)', h=self.heads), qkv)
+        q, k, v = [t.reshape(b, self.heads, -1, h * w) for t in qkv]
 
         q = q.softmax(dim=-2)
         k = k.softmax(dim=-1)
@@ -198,8 +197,7 @@ class LinearAttention(nn.Module):
         context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
 
         out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
-        out = rearrange(out, 'b h c (x y) -> b (h c) x y',
-                        h=self.heads, x=h, y=w)
+        out = out.reshape(b, -1, h, w)
         return self.to_out(out)
 
 
@@ -216,8 +214,7 @@ class Attention(nn.Module):
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(
-            t, 'b (h c) x y -> b h c (x y)', h=self.heads), qkv)
+        q, k, v = [t.reshape(b, self.heads, -1, h * w) for t in qkv]
 
         q = q * self.scale
 
@@ -225,7 +222,7 @@ class Attention(nn.Module):
         attn = sim.softmax(dim=-1)
         out = einsum('b h i j, b h d j -> b h i d', attn, v)
 
-        out = rearrange(out, 'b h (x y) d -> b (h d) x y', x=h, y=w)
+        out = out.reshape(b, self.heads, h, w, -1).permute(0, 1, 4, 2, 3).reshape(b, -1, h, w)
         return self.to_out(out)
 
 
@@ -236,13 +233,15 @@ class Unet(nn.Module):
         init_dim=None,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        channels=3,
+        channels=1,
         resnet_block_groups=8,
         learned_variance=False,
         learned_sinusoidal_cond=False,
         random_fourier_features=False,
         learned_sinusoidal_dim=16,
-        condition=True, # True for restoration or translation, while false for generation
+        condition=True,  # True for restoration/translation; False for generation
+        attn_heads=4,
+        attn_dim_head=32,
     ):
         super().__init__()
 
@@ -250,6 +249,8 @@ class Unet(nn.Module):
 
         self.channels = channels
         self.depth = len(dim_mults)
+        self.attn_heads = attn_heads
+        self.attn_dim_head = attn_dim_head
         input_channels = channels + channels * (1 if condition else 0)
 
         init_dim = default(init_dim, dim)
@@ -259,6 +260,8 @@ class Unet(nn.Module):
         in_out = list(zip(dims[:-1], dims[1:]))
 
         block_klass = partial(ResnetBlock, groups=resnet_block_groups)
+        linear_attn_klass = partial(LinearAttention, heads=attn_heads, dim_head=attn_dim_head)
+        attn_klass = partial(Attention, heads=attn_heads, dim_head=attn_dim_head)
 
         # time embeddings
 
@@ -293,14 +296,14 @@ class Unet(nn.Module):
             self.downs.append(nn.ModuleList([
                 block_klass(dim_in, dim_in, time_emb_dim=time_dim),
                 block_klass(dim_in, dim_in, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Residual(PreNorm(dim_in, linear_attn_klass(dim_in))),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(
                     dim_in, dim_out, 3, padding=1)
             ]))
 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_attn = Residual(PreNorm(mid_dim, attn_klass(mid_dim)))
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
@@ -309,7 +312,7 @@ class Unet(nn.Module):
             self.ups.append(nn.ModuleList([
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Residual(PreNorm(dim_out, linear_attn_klass(dim_out))),
                 Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(
                     dim_out, dim_in, 3, padding=1)
             ]))
@@ -328,6 +331,13 @@ class Unet(nn.Module):
         return x
     
     def forward(self, x_t, mu, time):
+        # Cast into the autocast dtype up front so regional torch.compile does not
+        # re-specialize Float -> BFloat16 after the first layer.
+        if torch.is_autocast_enabled("cuda"):
+            amp_dtype = torch.get_autocast_dtype("cuda")
+            x_t = x_t.to(dtype=amp_dtype)
+            mu = mu.to(dtype=amp_dtype)
+
         x = torch.cat((x_t, mu), dim=1)
         H, W = x.shape[2:]
         x = self.check_image_size(x, H, W)
@@ -382,14 +392,13 @@ if __name__ == '__main__':
     condition = True
     sampling_timesteps = 10
 
-    model = Unet(dim=64,dim_mults=(1, 2, 4, 8),condition=True)
+    model = Unet(dim=64, dim_mults=(1, 2, 4, 8), channels=1, condition=True)
     model.to(device)
 
-    input_data = torch.rand([2,3,512,512])
-    input_condi = torch.rand([2,3,512,512])
-    time_step = torch.randint(10,(2,))
-    print('time_step',time_step.shape)
+    input_data = torch.rand([2, 1, 512, 512])
+    input_condi = torch.rand([2, 1, 512, 512])
+    time_step = torch.randint(10, (2,))
+    print('time_step', time_step.shape)
     with torch.no_grad():
-        y = model(input_data.to(device),input_condi.to(device),time_step.to(device))
-    print(y.shape,y.max(),y.min())
-    print('Finished')
+        y = model(input_data.to(device), input_condi.to(device), time_step.to(device))
+        print(y.shape)

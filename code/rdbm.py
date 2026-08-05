@@ -15,8 +15,6 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from accelerate import Accelerator
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
 from ema_pytorch import EMA
 from PIL import Image
 import time
@@ -188,7 +186,7 @@ class RDBM(nn.Module):
             x_start = maybe_clip(x_start)
             noise = self.predict_noise_from_x_start(x_t, t, mu, x_start)
         else:
-            exit('please speficy the prediction mode')
+            exit('please specify the prediction mode')
 
         return ModelResPrediction(noise, x_start)
 
