@@ -378,27 +378,3 @@ class Unet(nn.Module):
         x = self.final_conv(x)
         x = x[..., :H, :W].contiguous()
         return x + mu # x
-
-if __name__ == '__main__':
-    print('Hello World')
-        
-    device = 'cuda'
-    image_size = 256
-    num_unet = 1
-    train_num_steps = 300000
-    train_batch_size = 16
-    sum_scale = 0.01
-    delta_end = 2.0e-3
-    condition = True
-    sampling_timesteps = 10
-
-    model = Unet(dim=64, dim_mults=(1, 2, 4, 8), channels=1, condition=True)
-    model.to(device)
-
-    input_data = torch.rand([2, 1, 512, 512])
-    input_condi = torch.rand([2, 1, 512, 512])
-    time_step = torch.randint(10, (2,))
-    print('time_step', time_step.shape)
-    with torch.no_grad():
-        y = model(input_data.to(device), input_condi.to(device), time_step.to(device))
-        print(y.shape)

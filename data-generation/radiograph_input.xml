@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SimulationConfig>
+
+  <Units length="cm" energy="MeV" density="g/cm3" angle="deg"/>
+
+  <Source>
+    <!-- Source above object, beam travels in -Z direction -->
+    <Location x="0" y="0" z="82" units="cm"/>
+    <Beam type="parallel"/>
+
+    <!-- Realistic focal spot for 2.25 MeV linac: ~1mm FWHM -->
+    <!-- sigma = FWHM / 2.355 = 0.1cm / 2.355 = 0.042 cm    -->
+    <FocalSpot enabled="true">
+      <n_samples>1</n_samples>
+      <sigma_x_cm>0.015</sigma_x_cm>
+      <sigma_y_cm>0.015</sigma_y_cm>
+      <sigma_z_cm>0.015</sigma_z_cm>
+    </FocalSpot>
+
+    <Spectrum type="mono" units="MeV">
+      <Mono energy="2.25" photons_per_ray="50000"/>
+    </Spectrum>
+  </Source>
+
+  <Object>
+    <!--
+      Object at z=20cm (between source z=60 and detector z=0).
+      STL from gmsh is in mm. gvxr will scale by 0.1 to get cm.
+      Phantom is 70mm diameter = 7cm. Centered at origin XY.
+    -->
+    <Location x="0" y="0" z="20" units="cm"/>
+    <Rotation pitch="0" roll="0" yaw="0"/>
+    <Jitter enabled="true" dist="normal" x_cm="0.0244" y_cm="0.0244" z_cm="0.0244" seed="42"/>
+    <RotationJitter enabled="true" dist="normal" pitch_deg="0.5" roll_deg="0.5" yaw_deg="0.5" seed="99"/>
+    
+    <Geometry>
+      <!--
+        units="mm": tells gvxr the STL mesh is in millimeters.
+        gvxr will convert to scene units (cm) automatically.
+      -->
+      <STL root_path="." units="mm">
+        <File>tungsten_pinhole_stepwedge_fixed.stl</File>
+      </STL>
+    </Geometry>
+  </Object>
+
+  <Detector>
+    <!--
+      Detector below object. Source->Object->Detector along -Z.
+      Source z=60, Object z=20, Detector z=0.
+      Magnification = SDD/SOD = 60/40 = 1.5x
+      Object is 7cm diameter. At 1.5x mag: 10.5cm on detector.
+      Detector must be wider than 10.5cm. Use 20cm x 20cm.
+    -->
+    <Location x="0" y="0" z="0" units="cm"/>
+    <Dimensions nx="2048" ny="2048"
+                width_cm="50.0" height_cm="50.0"
+                units="cm"/>
+    <Response
+      bit_depth="16"
+      full_well="65535"
+      gain="1.0"
+      readout_noise_e="5.0"
+      dark_current_adu="0.1"
+      exposure_time_s="1.0"
+      blur_sigma_px="1.2"
+      fpn_sigma="0.005"
+      fpn_seed="42"
+      distortion_k1="-0.0001"/>
+  </Detector>
+
+  <Noise
+    poisson="true"
+    photon_flux="50000"
+    readout_sigma_adu="5.0"
+    readout_seed="7"
+    scatter="true"
+    scatter_fraction="0.05"
+    scatter_blur_sigma="25.0"
+    fpn="true"
+    fpn_sigma="0.005"
+    fpn_seed="42"
+    poisson_seed="99"/>
+
+  <Scintillator
+    enabled="true"
+    material="CsI"
+    thickness_cm="0.05"
+    mu_cm_inv="8.0"
+    light_yield="1.0"
+    optical_blur_sigma_px="1.5"
+    saturation="false"
+    saturation_level="65535"/>
+
+  <Output
+    folder="fix_test_v2"
+    png="true"
+    npy="true"
+    flatfield="true"
+    darkfield="true"
+    n_projections="1"
+    rotation_step_deg="1.0"
+    gt_zoom="true"/>
+
+</SimulationConfig>

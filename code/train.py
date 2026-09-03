@@ -1,25 +1,30 @@
 import os
-import numpy as np
+import re
 import math
 import time
 import json
 import warnings
 
 import accelerate
+import imageio.v3 as imageio
+import numpy as np
 import torch
 import torch.nn.functional as F
 from argparse import ArgumentParser
-from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from pathlib import Path
 from skimage.metrics import structural_similarity
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import get_scheduler
-from rdbm import RDBM
-from networks import Unet
-from datasets_setting import RSDataset, set_seed
+
+from datasets_setting import RSDataset, peak_for_bit_depth, set_seed
 from muon import Muon
+from networks import Unet
+from rdbm import RDBM
+
+TARGET_ID_RE = re.compile(r"packed_calibration_target_(\d+)")
 
 # Inductor may skip online-softmax when it splits reductions; harmless.
 warnings.filterwarnings(
@@ -42,6 +47,21 @@ parser.add_argument(
     help="Path to dataset.json (NDJSON input/target pairs)",
 )
 parser.add_argument("--channels", type=int, default=1, help="Image channels (1=grayscale, 3=RGB)")
+parser.add_argument(
+    "--bit_depth",
+    type=str,
+    default="auto",
+    help="Input/output integer bit depth: auto|8|16. "
+         "auto infers from dtype (uint8/uint16) or float magnitude; "
+         "float/.npy ADU from radiograph.py typically uses peak 65535",
+)
+parser.add_argument(
+    "--data_range",
+    type=float,
+    default=None,
+    help="Override peak used to normalize inputs to [0,1] (e.g. 255, 65535). "
+         "If omitted, inferred from --bit_depth / file dtype",
+)
 parser.add_argument("--attn_heads", type=int, default=4, help="Number of attention heads in Unet")
 parser.add_argument("--attn_dim_head", type=int, default=32, help="Channels per attention head")
 parser.add_argument("--crop_size", type=int, default=256, help="Training random crop size")
@@ -63,14 +83,19 @@ parser.add_argument(
 )
 parser.add_argument("--lr", type=float, default=None, help="Learning rate (defaults: adam=8e-5, muon=1e-3)")
 parser.add_argument("--wd", type=float, default=0.1, help="Weight decay (used by muon; ignored by adam)")
-parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
-parser.add_argument("--adam_beta2", type=float, default=0.99, help="Adam beta2")
+parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam / Muon-AdamW beta1")
+parser.add_argument(
+    "--adam_beta2",
+    type=float,
+    default=0.95,
+    help="Adam / Muon-AdamW beta2",
+)
 parser.add_argument(
     "--lr_scheduler",
     type=str,
     default=None,
-    help="LR scheduler (default: cosine for muon, none for adam). "
-         "Examples: cosine, cosine_with_restarts, cosine_with_min_lr, constant",
+    help="LR scheduler (default: warmup_stable_decay for muon, none for adam). "
+         "Examples: warmup_stable_decay, cosine, cosine_with_restarts, constant",
 )
 parser.add_argument(
     "--warmup_steps",
@@ -84,7 +109,20 @@ parser.add_argument(
     type=float,
     default=None,
     help="Warmup as a fraction of train_num_steps "
-         "(default: 0.1 for muon cosine, 0 otherwise; overrides --warmup_steps)",
+         "(default: 0.1 for muon warmup_stable_decay; overrides --warmup_steps)",
+)
+parser.add_argument(
+    "--decay_ratio",
+    type=float,
+    default=None,
+    help="Decay-phase fraction of train_num_steps for warmup_stable_decay "
+         "(default: 0.5 for muon => stable until 50%%, then decay)",
+)
+parser.add_argument(
+    "--min_lr_ratio",
+    type=float,
+    default=0.0,
+    help="Final LR as a fraction of peak LR for warmup_stable_decay",
 )
 parser.add_argument("--train_num_steps", type=int, default=5001)
 parser.add_argument("--train_batch_size", type=int, default=16)
@@ -128,6 +166,17 @@ def divisible_by(numer, denom):
 
 def create_folder(folder_path):
     os.makedirs(folder_path, exist_ok=True)
+
+
+def target_id_from_path(path):
+    """Short id for eval outputs: numeric target, else STL/run stem."""
+    m = TARGET_ID_RE.search(str(path))
+    if m:
+        return m.group(1)
+    stem = Path(path).stem
+    stem = re.sub(r"_proj\d+_ground_truth$", "", stem)
+    stem = re.sub(r"_ground_truth$", "", stem)
+    return stem
 
 
 def find_latest_checkpoint_step(results_folder):
@@ -190,7 +239,7 @@ def build_adam_optimizer(model, lr, adam_betas=(0.9, 0.99)):
 
 
 def build_muon_optimizer(model, lr, wd, adam_betas=(0.9, 0.99)):
-    """Split params like multiscale-attention: Muon for >=2D, AdamW for the rest."""
+    """Split params: Muon for >=2D, AdamW for the rest."""
     adam_keys = ["embed"]
     muon_params, adam_params = [], []
     muon_param_count = adam_param_count = 0
@@ -226,26 +275,49 @@ def build_optimizer(model, optim_type, lr, wd, adam_betas=(0.9, 0.99)):
 
 
 def resolve_scheduler_name(optim_type, lr_scheduler):
-    """Default: cosine for muon (as in multiscale-attention), none for adam."""
+    """Default: warmup_stable_decay for muon, none for adam."""
     if lr_scheduler is not None and lr_scheduler != "" and lr_scheduler.lower() != "none":
         return lr_scheduler
     if optim_type == "muon":
-        return "cosine"
+        return "warmup_stable_decay"
     return None
 
 
-def build_lr_scheduler(optimizer, scheduler_name, num_training_steps, warmup_steps=0):
+def build_lr_scheduler(
+    optimizer,
+    scheduler_name,
+    num_training_steps,
+    warmup_steps=0,
+    decay_steps=None,
+    min_lr_ratio=0.0,
+):
     if scheduler_name is None:
         return None
-    print(
-        f"Using LR scheduler '{scheduler_name}' "
-        f"(warmup_steps={warmup_steps}, num_training_steps={num_training_steps})"
-    )
+    scheduler_kwargs = {}
+    if scheduler_name == "warmup_stable_decay":
+        if decay_steps is None:
+            raise ValueError("decay_steps is required for warmup_stable_decay")
+        scheduler_kwargs = {
+            "num_decay_steps": int(decay_steps),
+            "min_lr_ratio": float(min_lr_ratio),
+        }
+        stable_steps = max(num_training_steps - warmup_steps - int(decay_steps), 0)
+        print(
+            f"Using LR scheduler '{scheduler_name}' "
+            f"(warmup={warmup_steps}, stable={stable_steps}, decay={decay_steps}, "
+            f"total={num_training_steps}, min_lr_ratio={min_lr_ratio})"
+        )
+    else:
+        print(
+            f"Using LR scheduler '{scheduler_name}' "
+            f"(warmup_steps={warmup_steps}, num_training_steps={num_training_steps})"
+        )
     return get_scheduler(
         name=scheduler_name,
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=num_training_steps,
+        scheduler_specific_kwargs=scheduler_kwargs or None,
     )
 
 
@@ -262,9 +334,11 @@ class Trainer(object):
         optim='muon',
         train_lr=1e-3,
         train_wd=0.1,
-        adam_betas=(0.9, 0.99),
+        adam_betas=(0.9, 0.95),
         lr_scheduler=None,
         warmup_steps=0,
+        decay_steps=None,
+        min_lr_ratio=0.0,
         ema_update_every=1,
         ema_decay=0.995,
         amp=True,
@@ -277,6 +351,8 @@ class Trainer(object):
         split_ratio=0.8,
         split_seed=0,
         channels=1,
+        bit_depth="auto",
+        data_range=None,
         use_wandb=False,
     ):
         super().__init__()
@@ -292,6 +368,8 @@ class Trainer(object):
         self.image_size = diffusion_model.image_size
         self.max_grad_norm = max_grad_norm
         self.channels = channels
+        self.bit_depth = bit_depth
+        self.data_range = data_range
         self.crop_size = crop_size
         self.patch_size = patch_size
         self.patch_stride = patch_size // 2 if patch_stride is None else patch_stride
@@ -312,15 +390,22 @@ class Trainer(object):
             split_ratio=split_ratio,
             seed=split_seed,
             channels=channels,
+            bit_depth=bit_depth,
+            data_range=data_range,
         )
         self.dl_train = cycle(self.accelerator.prepare(
             DataLoader(self.ds_train, batch_size=train_batch_size, shuffle=True)
         ))
+        # Shared peak for saving integer PNGs (from training split detection / config).
+        self.output_peak = self.ds_train.detected_data_range
+        if self.output_peak is None or self.output_peak <= 1.0 + 1e-6:
+            # Already-normalized floats: default preview/export to 16-bit.
+            self.output_peak = peak_for_bit_depth(16 if str(bit_depth) == "16" else 8)
 
         if self.accelerator.is_main_process:
             self.accelerator.print(
-                'Training samples: {} (random {}x{} patches)'.format(
-                    len(self.ds_train), crop_size, crop_size
+                'Training samples: {} (random {}x{} patches), data_range={:g}'.format(
+                    len(self.ds_train), crop_size, crop_size, self.ds_train.detected_data_range
                 )
             )
 
@@ -333,6 +418,8 @@ class Trainer(object):
             seed=split_seed,
             channels=channels,
             full_image=True,
+            bit_depth=bit_depth,
+            data_range=data_range if data_range is not None else self.ds_train.detected_data_range,
         )
         self.dl_eval = self.accelerator.prepare(DataLoader(self.ds_eval, batch_size=1))
 
@@ -345,6 +432,8 @@ class Trainer(object):
             seed=split_seed,
             channels=channels,
             full_image=True,
+            bit_depth=bit_depth,
+            data_range=data_range if data_range is not None else self.ds_train.detected_data_range,
         )
         self.dl_eval_train = self.accelerator.prepare(
             DataLoader(self.ds_eval_train, batch_size=1)
@@ -374,6 +463,8 @@ class Trainer(object):
             scheduler_name=scheduler_name,
             num_training_steps=train_num_steps,
             warmup_steps=warmup_steps,
+            decay_steps=decay_steps,
+            min_lr_ratio=min_lr_ratio,
         )
         self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
         self.ema.to(self.device)
@@ -475,24 +566,37 @@ class Trainer(object):
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
         if self.scheduler is not None and data.get('scheduler') is not None:
-            self.scheduler.load_state_dict(data['scheduler'])
+            try:
+                self.scheduler.load_state_dict(data['scheduler'])
+            except Exception as e:
+                # e.g. cosine checkpoint -> warmup_stable_decay; re-sync by stepping.
+                if accelerator.is_main_process:
+                    accelerator.print(
+                        f'Could not load scheduler state ({e}); '
+                        f're-syncing schedule to step {self.step}'
+                    )
+                for _ in range(self.step):
+                    self.scheduler.step()
         if accelerator.is_main_process:
-            accelerator.print(f'Resumed at step {self.step}')
+            lr = self.opt.param_groups[0]["lr"]
+            accelerator.print(f'Resumed at step {self.step}, lr={lr:.6e}')
 
-    def cal_psnr(self, img_ref, img_gen, data_range=255.0):
-        mse = np.mean((img_ref.astype(np.float32) / data_range - img_gen.astype(np.float32) / data_range) ** 2)
-        if mse < 1.0e-10:
-            return 100
-        PIXEL_MAX = 1
-        return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
+    def cal_psnr(self, img_ref, img_gen, data_range=1.0):
+        """PSNR on arrays already scaled so peak intensity equals data_range (default [0,1])."""
+        ref = img_ref.astype(np.float32)
+        gen = img_gen.astype(np.float32)
+        mse = np.mean((ref - gen) ** 2) / (float(data_range) ** 2)
+        if mse < 1.0e-12:
+            return 100.0
+        return 20.0 * math.log10(1.0 / math.sqrt(mse))
 
-    def cal_ssim(self, img_ref, img_gen):
+    def cal_ssim(self, img_ref, img_gen, data_range=1.0):
         if img_ref.ndim == 2:
-            return structural_similarity(img_ref, img_gen, data_range=255)
+            return structural_similarity(img_ref, img_gen, data_range=data_range)
         ssim_val = 0
         for i in range(img_ref.shape[-1]):
             ssim_val = ssim_val + structural_similarity(
-                img_ref[:, :, i], img_gen[:, :, i], data_range=255
+                img_ref[:, :, i], img_gen[:, :, i], data_range=data_range
             )
         return ssim_val / img_ref.shape[-1]
 
@@ -531,33 +635,26 @@ class Trainer(object):
                     }, step=self.step)
 
                 if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
-                    # Compare train-split vs held-out test-split metrics
-                    self.test(dataloader=self.dl_eval_train, degradation='radio_train')
-                    self.test(dataloader=self.dl_eval, degradation='radio_test')
+                    self.test(dataloader=self.dl_eval_train, split='train')
+                    self.test(dataloader=self.dl_eval, split='test')
 
                 if self.accelerator.is_main_process:
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
                         write_json(track_metric_json_path, f'model-{self.step} : ')
                         metrics_dir = os.path.join(self.results_folder, f'model-{self.step}')
-                        train_json = os.path.join(metrics_dir, 'radio_train.json')
-                        test_json = os.path.join(metrics_dir, 'radio_test.json')
-                        train_psnr = float(readline_json(train_json, 'psnr'))
-                        train_ssim = float(readline_json(train_json, 'ssim'))
-                        test_psnr = float(readline_json(test_json, 'psnr'))
-                        test_ssim = float(readline_json(test_json, 'ssim'))
-                        accelerator.print(
-                            '      train -> PSNR / SSIM -> {:.6f} / {:.6f}'.format(train_psnr, train_ssim)
-                        )
-                        accelerator.print(
-                            '      test  -> PSNR / SSIM -> {:.6f} / {:.6f}'.format(test_psnr, test_ssim)
+                        train_psnr = float(readline_json(os.path.join(metrics_dir, 'train.json'), 'psnr'))
+                        train_ssim = float(readline_json(os.path.join(metrics_dir, 'train.json'), 'ssim'))
+                        test_psnr = float(readline_json(os.path.join(metrics_dir, 'test.json'), 'psnr'))
+                        test_ssim = float(readline_json(os.path.join(metrics_dir, 'test.json'), 'ssim'))
+                        accelerator.print(f'      train -> PSNR / SSIM -> {train_psnr:.6f} / {train_ssim:.6f}')
+                        accelerator.print(f'      test  -> PSNR / SSIM -> {test_psnr:.6f} / {test_ssim:.6f}')
+                        write_json(
+                            track_metric_json_path,
+                            f'    train -> PSNR / SSIM -> {train_psnr:.6f} / {train_ssim:.6f}',
                         )
                         write_json(
                             track_metric_json_path,
-                            '    radio_train -> PSNR / SSIM -> {:.6f} / {:.6f}'.format(train_psnr, train_ssim),
-                        )
-                        write_json(
-                            track_metric_json_path,
-                            '    radio_test  -> PSNR / SSIM -> {:.6f} / {:.6f}'.format(test_psnr, test_ssim),
+                            f'    test  -> PSNR / SSIM -> {test_psnr:.6f} / {test_ssim:.6f}',
                         )
                         if self.use_wandb and wandb is not None and wandb.run is not None:
                             wandb.log({
@@ -649,58 +746,50 @@ class Trainer(object):
         out = out / weight.clamp_min(1e-8)
         return out[:, :, :h, :w]
 
-    def test(self, dataloader, degradation):
-        start_time = time.time() if self.accelerator.is_main_process else None
-        save_json_dir = os.path.join(self.results_folder, f'model-{self.step}')
-        create_folder(save_json_dir)
-        save_json_path = os.path.join(save_json_dir, '{}.json'.format(degradation))
+    def test(self, dataloader, split):
+        """Evaluate full-res tiled restores; write {split}_{id}_restored.png + {split}.json."""
+        t0 = time.time() if self.accelerator.is_main_process else None
+        out_dir = os.path.join(self.results_folder, f'model-{self.step}')
+        create_folder(out_dir)
+        metrics_path = os.path.join(out_dir, f'{split}.json')
         if self.accelerator.is_main_process:
-            create_empty_json(save_json_path)
+            create_empty_json(metrics_path)
         self.ema.model.eval()
-        for batch_id, batch in enumerate(dataloader):
-            # Dataset returns (degraded/input, clean/target, path) at full resolution
-            condi_tf, image_tf, name_path = batch
+        for batch_id, (condi_tf, image_tf, name_path) in enumerate(dataloader):
             condi_tf = condi_tf.to(self.device)
             img_gen = self.sample_tiled(condi_tf)
 
-            for element_id in range(len(name_path)):
-                image_np_ref = self.tf2img(image_tf[element_id, :, :, ].unsqueeze(0))
-                image_np_gen = self.tf2img(img_gen[element_id, :, :, ].unsqueeze(0))
+            for i, path in enumerate(name_path):
+                ref = self.tf2np(torch.clamp(image_tf[i:i + 1], 0., 1.))
+                gen = self.tf2np(torch.clamp(img_gen[i:i + 1], 0., 1.))
+                h, w = ref.shape[:2]
+                gen = gen[:h, :w]
 
-                h, w = image_np_ref.shape[:2]
-                image_np_gen = image_np_gen[:h, :w]
+                psnr_val = self.cal_psnr(ref, gen, data_range=1.0)
+                ssim_val = self.cal_ssim(ref, gen, data_range=1.0)
 
-                psnr_val = self.cal_psnr(image_np_ref, image_np_gen)
-                ssim_val = self.cal_ssim(image_np_ref, image_np_gen)
-
-                # Save stitched restoration preview
-                stem = Path(name_path[element_id]).stem
-                out_png = os.path.join(save_json_dir, f'{degradation}_{stem}_restored.png')
+                tid = target_id_from_path(path)
+                out_png = os.path.join(out_dir, f'{split}_{tid}_restored.png')
                 try:
-                    import imageio.v3 as imageio
-                    imageio.imwrite(out_png, image_np_gen)
+                    imageio.imwrite(out_png, self.float_to_int_image(gen))
                 except Exception as e:
                     print(f'Warning: could not write {out_png}: {e}')
 
-                data_dump_info = {
-                    'file_path': name_path[element_id],
-                    'split': degradation,
+                write_json(metrics_path, {
+                    'file_path': path,
+                    'split': split,
+                    'target_id': tid,
                     'psnr': psnr_val,
                     'ssim': ssim_val,
+                    'bit_depth': self.bit_depth,
+                    'data_range': self.output_peak,
                     'patch_size': self.patch_size,
                     'patch_stride': self.patch_stride,
-                }
-                print(
-                    f'[{degradation}]', batch_id, name_path,
-                    'PSNR / SSIM : {:.6f} : {:.6f}'.format(psnr_val, ssim_val),
-                )
-                write_json(save_json_path, data_dump_info)
+                })
+                print(f'[{split}] {batch_id} id={tid} PSNR/SSIM {psnr_val:.4f}/{ssim_val:.4f}')
 
         if self.accelerator.is_main_process:
-            test_time_consuming = time.time() - start_time
-            self.accelerator.print(
-                f'{degradation} eval time : {test_time_consuming:.6f} s'
-            )
+            self.accelerator.print(f'{split} eval time : {time.time() - t0:.2f} s')
 
     def tf2np(self, image_tf):
         n, c, h, w = image_tf.size()
@@ -712,10 +801,16 @@ class Trainer(object):
 
         return image_np
 
+    def float_to_int_image(self, image_np):
+        """Quantize a float [0,1] image to uint8 or uint16 for PNG export."""
+        peak = float(self.output_peak)
+        if peak <= 255.0 + 1e-6:
+            return np.clip(np.rint(image_np * 255.0), 0, 255).astype(np.uint8)
+        return np.clip(np.rint(image_np * 65535.0), 0, 65535).astype(np.uint16)
+
     def tf2img(self, image_tf):
         image_np = self.tf2np(torch.clamp(image_tf, min=0., max=1.))
-        image_np = (image_np * 255).astype(np.uint8)
-        return image_np
+        return self.float_to_int_image(image_np)
 
 
 def init_wandb(args, results_folder):
@@ -751,6 +846,8 @@ def init_wandb(args, results_folder):
             "exp_id": args.exp_id,
             "dataset_json": args.dataset_json,
             "channels": args.channels,
+            "bit_depth": args.bit_depth,
+            "data_range": args.data_range,
             "attn_heads": args.attn_heads,
             "attn_dim_head": args.attn_dim_head,
             "crop_size": args.crop_size,
@@ -762,6 +859,10 @@ def init_wandb(args, results_folder):
             "lr_scheduler": args.lr_scheduler,
             "warmup_steps": args.warmup_steps,
             "warmup_ratio": args.warmup_ratio,
+            "decay_ratio": args.decay_ratio,
+            "min_lr_ratio": args.min_lr_ratio,
+            "adam_beta1": args.adam_beta1,
+            "adam_beta2": args.adam_beta2,
             "train_num_steps": args.train_num_steps,
             "train_batch_size": args.train_batch_size,
             "save_and_sample_every": args.save_and_sample_every,
@@ -785,6 +886,7 @@ def train_ddp_accelerate(args):
     print('Dataset JSON: ', args.dataset_json)
     print('Optimizer: ', args.optim)
     print('Train crop / eval patch: ', args.crop_size, args.patch_size, args.patch_stride)
+    print('Bit depth / data_range: ', args.bit_depth, args.data_range)
 
     default_lrs = {'adam': 8e-5, 'muon': 1e-3}
     lr = args.lr if args.lr is not None else default_lrs[args.optim]
@@ -792,12 +894,12 @@ def train_ddp_accelerate(args):
 
     args.lr_scheduler = resolve_scheduler_name(args.optim, args.lr_scheduler)
 
-    # Linear warmup then cosine: default 10% of steps for muon.
+    # Muon default: warmup 10% -> stable until 50% -> decay 50%.
     if args.warmup_ratio is not None:
         warmup_ratio = args.warmup_ratio
     elif args.warmup_steps is not None:
         warmup_ratio = None
-    elif args.optim == "muon" and args.lr_scheduler == "cosine":
+    elif args.optim == "muon" and args.lr_scheduler == "warmup_stable_decay":
         warmup_ratio = 0.1
     else:
         warmup_ratio = 0.0
@@ -805,11 +907,27 @@ def train_ddp_accelerate(args):
     if warmup_ratio is not None:
         warmup_steps = int(args.train_num_steps * warmup_ratio)
     else:
-        warmup_steps = args.warmup_steps
+        warmup_steps = args.warmup_steps or 0
+
+    if args.decay_ratio is not None:
+        decay_ratio = args.decay_ratio
+    elif args.optim == "muon" and args.lr_scheduler == "warmup_stable_decay":
+        decay_ratio = 0.5
+    else:
+        decay_ratio = 0.0
+    decay_steps = int(args.train_num_steps * decay_ratio)
+
     args.warmup_ratio = warmup_ratio
     args.warmup_steps = warmup_steps
-    print(f"LR schedule: {args.lr_scheduler}, warmup_steps={warmup_steps} "
-          f"({(warmup_steps / max(args.train_num_steps, 1)):.1%} of train_num_steps)")
+    args.decay_ratio = decay_ratio
+    stable_steps = max(args.train_num_steps - warmup_steps - decay_steps, 0)
+    print(
+        f"LR schedule: {args.lr_scheduler}, "
+        f"warmup={warmup_steps} ({warmup_steps / max(args.train_num_steps, 1):.1%}), "
+        f"stable={stable_steps} ({stable_steps / max(args.train_num_steps, 1):.1%}), "
+        f"decay={decay_steps} ({decay_steps / max(args.train_num_steps, 1):.1%}), "
+        f"beta2={args.adam_beta2}"
+    )
 
     model = Unet(
         dim=64,
@@ -820,8 +938,6 @@ def train_ddp_accelerate(args):
         attn_dim_head=args.attn_dim_head,
     )
     if args.compile:
-        # Whole-UNet compile (static). Safe now that einops is gone from the hot path;
-        # einops lru_cache used to graph-break and re-specialize Residual across widths.
         print("torch.compile: enabling on UNet (first steps will be slower while compiling)")
         model = torch.compile(model)
     diffusion = RDBM(
@@ -853,6 +969,8 @@ def train_ddp_accelerate(args):
         adam_betas=(args.adam_beta1, args.adam_beta2),
         lr_scheduler=args.lr_scheduler,
         warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        min_lr_ratio=args.min_lr_ratio,
         amp=use_amp,
         mixed_precision_type=mixed_precision,
         crop_size=args.crop_size,
@@ -861,6 +979,8 @@ def train_ddp_accelerate(args):
         split_ratio=args.split_ratio,
         split_seed=args.split_seed,
         channels=args.channels,
+        bit_depth=args.bit_depth,
+        data_range=args.data_range,
         use_wandb=bool(args.use_wandb),
     )
     if RDBM_Trainer.use_wandb:

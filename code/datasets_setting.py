@@ -34,13 +34,52 @@ def set_seed(SEED):
     random.seed(SEED)
 
 
-class RSDataset(Dataset):
-    """Paired image dataset driven by a single dataset.json (NDJSON).
+def peak_for_bit_depth(bit_depth):
+    """Linear peak value for an integer bit depth (8 -> 255, 16 -> 65535)."""
+    bit_depth = int(bit_depth)
+    if bit_depth not in (8, 16):
+        raise ValueError(f"bit_depth must be 8 or 16, got {bit_depth}")
+    return float((1 << bit_depth) - 1)
 
-    Each line: {"input": "in/foo.png", "target": "target/foo.png"}
-    Paths are resolved relative to the directory containing dataset.json.
-    Train/test split is computed automatically (seeded shuffle + ratio).
+
+def infer_data_range(array, data_range=None, bit_depth="auto"):
+    """Infer the divisor that maps image samples into [0, 1].
+
+    Priority:
+      1. explicit data_range
+      2. bit_depth in {8, 16}
+      3. dtype / magnitude heuristics (uint8/uint16/float ADU / already-normalized)
     """
+    if data_range is not None:
+        return float(data_range)
+    if bit_depth not in (None, "auto", "Auto"):
+        return peak_for_bit_depth(bit_depth)
+
+    arr = np.asarray(array)
+    if np.issubdtype(arr.dtype, np.integer):
+        return float(np.iinfo(arr.dtype).max)
+
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 1.0
+    mx = float(finite.max())
+    if mx <= 1.0 + 1e-3:
+        return 1.0
+    if mx <= 255.0 + 1e-3:
+        return 255.0
+    return 65535.0
+
+
+def read_image_array(path):
+    """Load PNG/NPY (and other imageio-readable) arrays without normalizing."""
+    path = str(path)
+    if path.lower().endswith(".npy"):
+        return np.load(path)
+    return np.asarray(imageio.imread(path))
+
+
+class RSDataset(Dataset):
+    """Paired NDJSON dataset: {"input": "...", "target": "..."}; supports 8/16-bit PNG and .npy."""
 
     def __init__(
         self,
@@ -51,6 +90,8 @@ class RSDataset(Dataset):
         seed=0,
         channels=1,
         full_image=False,
+        bit_depth="auto",
+        data_range=None,
     ):
         super().__init__()
         assert mode in ['train', 'test']
@@ -60,54 +101,59 @@ class RSDataset(Dataset):
         self.dataset_json = os.path.abspath(dataset_json)
         self.root_dir = os.path.dirname(self.dataset_json)
         self.mode = mode
-        # full_image=True: return full-res (for PSNR/SSIM); skip train crop/aug
-        self.full_image = full_image
+        self.full_image = full_image  # skip crop/aug; full-res for metrics
         self.crop_size = crop_size
         self.channels = channels
+        self.bit_depth = bit_depth
+        self.data_range = data_range
         self.transform = T.ToTensor()
 
         pairs = self.load_json(self.dataset_json)
-        assert len(pairs) > 0, f"dataset.json is empty: {self.dataset_json}"
+        assert pairs, f"dataset.json is empty: {self.dataset_json}"
 
         rng = random.Random(seed)
         indices = list(range(len(pairs)))
         rng.shuffle(indices)
-
         n_train = max(1, int(round(len(pairs) * split_ratio)))
         if len(pairs) > 1:
             n_train = min(n_train, len(pairs) - 1)
-        train_idx = set(indices[:n_train])
-        selected = train_idx if mode == 'train' else set(indices[n_train:])
-        if mode == 'test' and len(selected) == 0:
+        selected = set(indices[:n_train] if mode == 'train' else indices[n_train:])
+        if mode == 'test' and not selected:
             selected = {indices[-1]}
 
-        self.input_path = []
-        self.target_path = []
-        for i in sorted(selected):
-            item = pairs[i]
-            self.input_path.append(os.path.join(self.root_dir, item['input']))
-            self.target_path.append(os.path.join(self.root_dir, item['target']))
-
-        assert len(self.input_path) == len(self.target_path)
+        self.input_path = [os.path.join(self.root_dir, pairs[i]['input']) for i in sorted(selected)]
+        self.target_path = [os.path.join(self.root_dir, pairs[i]['target']) for i in sorted(selected)]
         print(
             f"RSDataset mode={mode} pairs={len(self.input_path)} "
-            f"(total={len(pairs)}, split_ratio={split_ratio}, seed={seed}, "
-            f"full_image={full_image})"
+            f"(total={len(pairs)}, split_ratio={split_ratio}, seed={seed}, bit_depth={bit_depth})"
         )
 
-        # Decode once into RAM; PNG I/O dominated step time on 2k radiographs.
-        self._cache = []
+        # Cache decoded+normalized arrays (shared data_range across the split).
+        raw_pairs = []
+        ranges = []
         for input_path, target_path in zip(self.input_path, self.target_path):
-            im_degrade = self.load_image(input_path)
-            im_clean = self.load_image(target_path)
-            if not self.check_size(im_degrade, im_clean):
+            raw_in = read_image_array(input_path)
+            raw_gt = read_image_array(target_path)
+            ranges.append(infer_data_range(raw_in, data_range=self.data_range, bit_depth=self.bit_depth))
+            ranges.append(infer_data_range(raw_gt, data_range=self.data_range, bit_depth=self.bit_depth))
+            raw_pairs.append((raw_in, raw_gt, input_path, target_path))
+
+        self.detected_data_range = float(self.data_range) if self.data_range is not None else float(max(ranges))
+        self._cache = []
+        for raw_in, raw_gt, input_path, target_path in raw_pairs:
+            im_degrade = self._normalize_image(raw_in, self.detected_data_range, input_path)
+            im_clean = self._normalize_image(raw_gt, self.detected_data_range, target_path)
+            if im_degrade.shape != im_clean.shape:
                 raise ValueError(
                     f"Unmatched image sizes: {target_path} {im_clean.shape} vs "
                     f"{input_path} {im_degrade.shape}"
                 )
             self._cache.append((im_degrade, im_clean))
         nbytes = sum(a.nbytes + b.nbytes for a, b in self._cache)
-        print(f"RSDataset mode={mode}: cached {len(self._cache)} pairs ({nbytes / 1e6:.1f} MB)")
+        print(
+            f"RSDataset mode={mode}: cached {len(self._cache)} pairs "
+            f"({nbytes / 1e6:.1f} MB), data_range={self.detected_data_range:g}"
+        )
 
     def __len__(self):
         assert len(self.target_path) > 0, "selected split is empty"
@@ -118,33 +164,20 @@ class RSDataset(Dataset):
         im_path = self.target_path[index]
 
         if self.mode == 'train' and not self.full_image:
-            # Random patch + D4 augmentation for training only.
-            # full_image=True keeps the train-split images full-res for metrics.
             im_degrade, im_clean = self.random_crop_size(im_degrade, im_clean, self.crop_size)
             im_degrade, im_clean = self.random_dihedral_augment(im_degrade, im_clean)
 
         if self.transform is not None:
             im_degrade = self.transform(im_degrade)
             im_clean = self.transform(im_clean)
-
         return im_degrade, im_clean, im_path
 
-    def check_size(self, input, target):
-        if input.shape != target.shape:
-            return 0
-        return 1
-
-    def load_image(self, path, data_range=255.0):
-        sample = imageio.imread(path)
+    def _normalize_image(self, sample, data_range, path=""):
+        """Raw array -> float32 HxWxC in [0, 1]."""
         sample = np.asarray(sample)
-
-        if sample.ndim == 2:
-            # grayscale HxW
-            pass
-        elif sample.ndim == 3:
+        if sample.ndim == 3:
             if sample.shape[2] >= 3 and self.channels == 1:
-                # RGB -> luminance
-                rgb = sample[:, :, :3].astype('float32')
+                rgb = sample[:, :, :3].astype(np.float32)
                 sample = 0.2989 * rgb[:, :, 0] + 0.5870 * rgb[:, :, 1] + 0.1140 * rgb[:, :, 2]
             elif sample.shape[2] >= 3 and self.channels == 3:
                 sample = sample[:, :, :3]
@@ -152,23 +185,34 @@ class RSDataset(Dataset):
                 sample = sample[:, :, 0]
             else:
                 raise ValueError(f"Unsupported image shape {sample.shape} for {path}")
-        else:
+        elif sample.ndim != 2:
             raise ValueError(f"Unsupported image ndim {sample.ndim} for {path}")
 
-        sample = np.clip(sample, 0, data_range).astype('float32') / data_range
+        sample = sample.astype(np.float32)
+        if data_range <= 1.0 + 1e-6:
+            sample = np.clip(sample, 0.0, 1.0)
+        else:
+            sample = np.clip(sample, 0.0, data_range) / data_range
 
         if self.channels == 1:
             if sample.ndim == 2:
                 sample = sample[:, :, None]
-            elif sample.ndim == 3 and sample.shape[2] != 1:
+            elif sample.shape[2] != 1:
                 raise ValueError(f"Expected 1 channel, got shape {sample.shape} for {path}")
         else:
             if sample.ndim == 2:
                 sample = np.stack([sample, sample, sample], axis=-1)
             elif sample.shape[2] != 3:
                 raise ValueError(f"Expected 3 channels, got shape {sample.shape} for {path}")
-
         return sample
+
+    def load_image(self, path, data_range=None):
+        raw = read_image_array(path)
+        if data_range is None:
+            data_range = self.detected_data_range
+            if data_range is None:
+                data_range = infer_data_range(raw, data_range=self.data_range, bit_depth=self.bit_depth)
+        return self._normalize_image(raw, data_range, path)
 
     def load_json(self, json_path):
         data = []
@@ -201,26 +245,25 @@ class RSDataset(Dataset):
     def random_crop_size(self, imageA, imageB, crop_size):
         imageA = self.resize_shape(imageA, crop_size)
         imageB = self.resize_shape(imageB, crop_size)
-
-        if not self.check_size(imageA, imageB):
-            exit('Unmatched image sizes')
-
-        h, w = imageB.shape[0], imageB.shape[1]
-        h_start = np.random.randint(0, h - crop_size + 1)
-        w_start = np.random.randint(0, w - crop_size + 1)
-        imageA_crop = imageA[h_start:h_start + crop_size, w_start:w_start + crop_size, :]
-        imageB_crop = imageB[h_start:h_start + crop_size, w_start:w_start + crop_size, :]
-        return imageA_crop, imageB_crop
+        if imageA.shape != imageB.shape:
+            raise ValueError(f'Unmatched crop sizes {imageA.shape} vs {imageB.shape}')
+        h, w = imageB.shape[:2]
+        y0 = np.random.randint(0, h - crop_size + 1)
+        x0 = np.random.randint(0, w - crop_size + 1)
+        return (
+            imageA[y0:y0 + crop_size, x0:x0 + crop_size, :],
+            imageB[y0:y0 + crop_size, x0:x0 + crop_size, :],
+        )
 
     def random_dihedral_augment(self, imageA, imageB):
         """Apply a random D4 symmetry (k*90° rotation and/or reflection) to both images."""
         k = np.random.randint(0, 4)
-        do_flip = np.random.rand() < 0.5
+        flip = np.random.rand() < 0.5
 
         def _apply(img):
             out = np.rot90(img, k=k, axes=(0, 1))
-            if do_flip:
-                out = np.flip(out, axis=1)  # horizontal reflection
+            if flip:
+                out = np.flip(out, axis=1)
             return np.ascontiguousarray(out)
 
         return _apply(imageA), _apply(imageB)
@@ -246,9 +289,8 @@ class RSDataset(Dataset):
 
 
 if __name__ == '__main__':
-    print('Hello World')
     set_seed(11)
-    root = os.path.join(os.path.dirname(__file__), '..', 'radiography', 'fix_test_v2', 'dataset.json')
+    root = os.path.join(os.path.dirname(__file__), '..', 'data-generation', 'fix_test_v2', 'dataset.json')
     for mode in ['train', 'test']:
         ds = RSDataset(dataset_json=root, mode=mode, channels=1)
         print(len(ds))

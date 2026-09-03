@@ -317,6 +317,3 @@ class RDBM(nn.Module):
         t = torch.clamp(t, min=0, max=self.num_timesteps-1)
 
         return self.p_losses(img, t, *args, **kwargs)
-
-if __name__ == '__main__':
-    print('Hello World')
