@@ -1,9 +1,32 @@
 #!/usr/bin/env python3
-"""Comparison panels for {train|test|eval}_{id}_restored.png.
+"""Comparison plots for {train|test|eval}_{id}_restored.png.
 
-Default 2x2: GT | corrupted / restored | error.
---error-attenuation 3x2: GT | rescale-only error / rescaled corrupted | restored error / restored | error attenuation.
---error-attenuation --layout 1x2: GT | error attenuation (no header; writes *_compare_1x2.png).
+Run from code/. Looks up matching ground truth (and noisy input) under --data-root.
+
+Layouts:
+
+  2x2  (default)
+    GT | corrupted
+    restored | |GT − restored|
+      python compare_restorations.py \\
+        --restored-dir save_folder/radio_4/model-10000 \\
+        --data-root ../data-generation/fix_test_realistic_v2
+
+  3x2  (--error-attenuation)
+    GT                  | rescale-only error
+    rescaled corrupted  | restored error
+    restored            | error attenuation
+      python compare_restorations.py --error-attenuation \\
+        --restored-dir save_folder/radio_4/model-10000 \\
+        --data-root ../data-generation/fix_test_realistic_v2
+
+  1x2  (--error-attenuation --layout 1x2)
+    GT | error attenuation
+      python compare_restorations.py --error-attenuation --layout 1x2 \\
+        --restored-dir save_folder/radio_4/model-10000 \\
+        --data-root ../data-generation/fix_test_realistic_v2
+
+Writes {split}_{id}_compare.png, or {split}_{id}_compare_1x2.png for the 1x2 layout.
 """
 
 from __future__ import annotations
@@ -471,24 +494,62 @@ def plot_error(diff, out_path, show, diff_vmax, log_diff):
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--restored-dir", type=Path, default=Path("save_folder/radio_4/model-10000"))
-    p.add_argument("--data-root", type=Path, default=Path("../data-generation/fix_test_realistic_v2"))
-    p.add_argument("--output-dir", type=Path, default=None)
-    p.add_argument("--split", choices=["all", "train", "test", "eval"], default="all")
-    p.add_argument("--diff-vmax", type=float, default=None)
-    p.add_argument("--linear-diff", action="store_true")
-    p.add_argument("--show", action="store_true")
-    p.add_argument("--gt-ext", choices=["png", "npy"], default="png")
+    p.add_argument(
+        "--restored-dir",
+        type=Path,
+        default=Path("save_folder/radio_4/model-10000"),
+        help="Folder of {train|test|eval}_{id}_restored.png from train.py or eval_stl.py",
+    )
+    p.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("../data-generation/fix_test_realistic_v2"),
+        help="Dataset root used to look up matching *_ground_truth and *_noisy files",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where to write comparison PNGs (default: <restored-dir>/comparisons)",
+    )
+    p.add_argument(
+        "--split",
+        choices=["all", "train", "test", "eval"],
+        default="all",
+        help="Only plot this split's restorations (default: all)",
+    )
+    p.add_argument(
+        "--diff-vmax",
+        type=float,
+        default=None,
+        help="Colorbar cap for abs. error / data range (default: max error in the figure)",
+    )
+    p.add_argument(
+        "--linear-diff",
+        action="store_true",
+        help="Linear error color scale (default is log)",
+    )
+    p.add_argument(
+        "--show",
+        action="store_true",
+        help="Open each comparison in a window instead of only writing PNGs",
+    )
+    p.add_argument(
+        "--gt-ext",
+        choices=["png", "npy"],
+        default="png",
+        help="Extension of the ground-truth / noisy files under --data-root",
+    )
     p.add_argument(
         "--error-attenuation",
         action="store_true",
-        help="3x2 layout: GT/rescaled/restored | rescale-only error/restored error/attenuation",
+        help="Replace the default 2x2 with error attenuation layout (3x2, or 1x2 if --layout 1x2)",
     )
     p.add_argument(
         "--layout",
         choices=["3x2", "1x2"],
         default="3x2",
-        help="With --error-attenuation: 3x2 (default) or 1x2 GT|attenuation",
+        help="Only with --error-attenuation: 3x2 (GT / rescaled / restored + errors) or 1x2 (GT | attenuation)",
     )
     args = p.parse_args()
 

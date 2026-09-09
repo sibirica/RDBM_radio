@@ -64,8 +64,12 @@ parser.add_argument(
 )
 parser.add_argument("--attn_heads", type=int, default=4, help="Number of attention heads in Unet")
 parser.add_argument("--attn_dim_head", type=int, default=32, help="Channels per attention head")
-parser.add_argument("--crop_size", type=int, default=256, help="Training random crop size")
-parser.add_argument("--patch_size", type=int, default=256, help="Eval tile size for stitched inference")
+parser.add_argument(
+    "--patch_size",
+    type=int,
+    default=256,
+    help="Train crop and eval tile size (same window for both)",
+)
 parser.add_argument(
     "--patch_stride",
     type=int,
@@ -345,7 +349,6 @@ class Trainer(object):
         mixed_precision_type='bf16',
         split_batches=True,
         max_grad_norm=1.,
-        crop_size=256,
         patch_size=256,
         patch_stride=None,
         split_ratio=0.8,
@@ -370,7 +373,6 @@ class Trainer(object):
         self.channels = channels
         self.bit_depth = bit_depth
         self.data_range = data_range
-        self.crop_size = crop_size
         self.patch_size = patch_size
         self.patch_stride = patch_size // 2 if patch_stride is None else patch_stride
         if self.patch_stride < 1 or self.patch_stride > self.patch_size:
@@ -386,7 +388,7 @@ class Trainer(object):
         self.ds_train = RSDataset(
             dataset_json=self.dataset_json,
             mode='train',
-            crop_size=crop_size,
+            patch_size=patch_size,
             split_ratio=split_ratio,
             seed=split_seed,
             channels=channels,
@@ -405,7 +407,7 @@ class Trainer(object):
         if self.accelerator.is_main_process:
             self.accelerator.print(
                 'Training samples: {} (random {}x{} patches), data_range={:g}'.format(
-                    len(self.ds_train), crop_size, crop_size, self.ds_train.detected_data_range
+                    len(self.ds_train), patch_size, patch_size, self.ds_train.detected_data_range
                 )
             )
 
@@ -413,7 +415,7 @@ class Trainer(object):
         self.ds_eval = RSDataset(
             dataset_json=self.dataset_json,
             mode='test',
-            crop_size=crop_size,
+            patch_size=patch_size,
             split_ratio=split_ratio,
             seed=split_seed,
             channels=channels,
@@ -427,7 +429,7 @@ class Trainer(object):
         self.ds_eval_train = RSDataset(
             dataset_json=self.dataset_json,
             mode='train',
-            crop_size=crop_size,
+            patch_size=patch_size,
             split_ratio=split_ratio,
             seed=split_seed,
             channels=channels,
@@ -508,7 +510,7 @@ class Trainer(object):
             return
         device = self.device
         c = self.channels
-        size = self.crop_size
+        size = self.patch_size
         x = torch.randn(1, c, size, size, device=device)
         with torch.no_grad(), self.accelerator.autocast():
             # Run through the DDP-wrapped module (no accelerate unwrap).
@@ -850,7 +852,6 @@ def init_wandb(args, results_folder):
             "data_range": args.data_range,
             "attn_heads": args.attn_heads,
             "attn_dim_head": args.attn_dim_head,
-            "crop_size": args.crop_size,
             "patch_size": args.patch_size,
             "patch_stride": args.patch_stride,
             "optim": args.optim,
@@ -885,7 +886,7 @@ def train_ddp_accelerate(args):
     print('Experiment: ', args.exp_id)
     print('Dataset JSON: ', args.dataset_json)
     print('Optimizer: ', args.optim)
-    print('Train crop / eval patch: ', args.crop_size, args.patch_size, args.patch_stride)
+    print('Patch size / stride: ', args.patch_size, args.patch_stride)
     print('Bit depth / data_range: ', args.bit_depth, args.data_range)
 
     default_lrs = {'adam': 8e-5, 'muon': 1e-3}
@@ -942,7 +943,7 @@ def train_ddp_accelerate(args):
         model = torch.compile(model)
     diffusion = RDBM(
         model,
-        image_size=args.crop_size,
+        image_size=args.patch_size,
         objective='pred_x_start',
         sampling_type='pred_x_start',
         timesteps=100,
@@ -973,7 +974,6 @@ def train_ddp_accelerate(args):
         min_lr_ratio=args.min_lr_ratio,
         amp=use_amp,
         mixed_precision_type=mixed_precision,
-        crop_size=args.crop_size,
         patch_size=args.patch_size,
         patch_stride=args.patch_stride,
         split_ratio=args.split_ratio,

@@ -1,16 +1,38 @@
 #!/usr/bin/env bash
-# Build dataset.json from paired noisy/ground_truth files under DATA_DIR.
-# Searches DATA_DIR + one child level only (-maxdepth 2); nested folders
-# are ignored — run this script on them separately.
-#
-#   ./organize_radio.sh [/path/to/data]
-#   FORMAT=npy ./organize_radio.sh /path/to/data
+# Build dataset.json from paired noisy / ground_truth files.
+# Run from data-generation/:
+#   ./organize_radio.sh
+#   ./organize_radio.sh /path/to/data
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="$(cd "${1:-${SCRIPT_DIR}/fix_test_realistic_v2}" && pwd)"
-DATASET_JSON="${DATA_DIR}/dataset.json"
+
+
+
+
+
+# --- edit these! (or override the same names as env vars) ---
+
+# Folder of *_noisy / *_ground_truth pairs. A CLI path overrides this default.
+DATA_DIR="${SCRIPT_DIR}/fix_test_realistic_v2"
+# png or npy
 FORMAT="${FORMAT:-png}"
+
+
+
+
+
+# --- write dataset.json from matching *_noisy / *_ground_truth files (no need to edit below this point) ---
+
+if [[ $# -ge 1 ]]; then
+  DATA_DIR="$1"
+fi
+if [[ ! -d "${DATA_DIR}" ]]; then
+  echo "Error: data directory does not exist: ${DATA_DIR}" >&2
+  exit 1
+fi
+DATA_DIR="$(cd "${DATA_DIR}" && pwd)"
+DATASET_JSON="${DATA_DIR}/dataset.json"
 
 if [[ "${FORMAT}" != "png" && "${FORMAT}" != "npy" ]]; then
   echo "Error: FORMAT must be png or npy, got: ${FORMAT}" >&2
@@ -20,11 +42,6 @@ fi
 EXT="${FORMAT}"
 NOISY_SUFFIX="_noisy.${EXT}"
 GT_SUFFIX="_ground_truth.${EXT}"
-
-if [[ ! -d "${DATA_DIR}" ]]; then
-  echo "Error: data directory does not exist: ${DATA_DIR}" >&2
-  exit 1
-fi
 
 : > "${DATASET_JSON}"
 count=0

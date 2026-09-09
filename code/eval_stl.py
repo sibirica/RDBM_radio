@@ -197,7 +197,7 @@ def build_trainer(dataset_json: Path, results_folder: Path, args) -> Trainer:
     )
     diffusion = RDBM(
         model,
-        image_size=args.crop_size,
+        image_size=args.patch_size,
         objective="pred_x_start",
         sampling_type="pred_x_start",
         timesteps=100,
@@ -217,7 +217,6 @@ def build_trainer(dataset_json: Path, results_folder: Path, args) -> Trainer:
         train_lr=1e-4,
         amp=use_amp,
         mixed_precision_type=mixed_precision,
-        crop_size=args.crop_size,
         patch_size=args.patch_size,
         patch_stride=args.patch_stride,
         split_ratio=0.5,
@@ -333,7 +332,7 @@ def parse_args():
         "--density",
         type=float,
         default=None,
-        help="Override material density in g/cm3 (default: 19.3 if --material W, else 7.93)",
+        help="Override material density in g/cm3 (default: 19.3 for --material W, else 7.93)",
     )
     p.add_argument("--compare", action="store_true", default=True, help="Write comparison panels (default)")
     p.add_argument("--no-compare", action="store_false", dest="compare")
@@ -345,7 +344,6 @@ def parse_args():
     p.add_argument("--channels", type=int, default=1)
     p.add_argument("--attn_heads", type=int, default=4)
     p.add_argument("--attn_dim_head", type=int, default=16)
-    p.add_argument("--crop_size", type=int, default=256)
     p.add_argument("--patch_size", type=int, default=256)
     p.add_argument("--patch_stride", type=int, default=None)
     p.add_argument("--bit_depth", type=str, default="auto")

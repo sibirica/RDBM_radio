@@ -85,7 +85,7 @@ class RSDataset(Dataset):
         self,
         dataset_json,
         mode='train',
-        crop_size=256,
+        patch_size=256,
         split_ratio=0.8,
         seed=0,
         channels=1,
@@ -102,7 +102,7 @@ class RSDataset(Dataset):
         self.root_dir = os.path.dirname(self.dataset_json)
         self.mode = mode
         self.full_image = full_image  # skip crop/aug; full-res for metrics
-        self.crop_size = crop_size
+        self.patch_size = patch_size
         self.channels = channels
         self.bit_depth = bit_depth
         self.data_range = data_range
@@ -164,7 +164,7 @@ class RSDataset(Dataset):
         im_path = self.target_path[index]
 
         if self.mode == 'train' and not self.full_image:
-            im_degrade, im_clean = self.random_crop_size(im_degrade, im_clean, self.crop_size)
+            im_degrade, im_clean = self.random_crop_size(im_degrade, im_clean, self.patch_size)
             im_degrade, im_clean = self.random_dihedral_augment(im_degrade, im_clean)
 
         if self.transform is not None:
@@ -242,17 +242,17 @@ class RSDataset(Dataset):
                 image = image[:, :, None]
         return image
 
-    def random_crop_size(self, imageA, imageB, crop_size):
-        imageA = self.resize_shape(imageA, crop_size)
-        imageB = self.resize_shape(imageB, crop_size)
+    def random_crop_size(self, imageA, imageB, size):
+        imageA = self.resize_shape(imageA, size)
+        imageB = self.resize_shape(imageB, size)
         if imageA.shape != imageB.shape:
             raise ValueError(f'Unmatched crop sizes {imageA.shape} vs {imageB.shape}')
         h, w = imageB.shape[:2]
-        y0 = np.random.randint(0, h - crop_size + 1)
-        x0 = np.random.randint(0, w - crop_size + 1)
+        y0 = np.random.randint(0, h - size + 1)
+        x0 = np.random.randint(0, w - size + 1)
         return (
-            imageA[y0:y0 + crop_size, x0:x0 + crop_size, :],
-            imageB[y0:y0 + crop_size, x0:x0 + crop_size, :],
+            imageA[y0:y0 + size, x0:x0 + size, :],
+            imageB[y0:y0 + size, x0:x0 + size, :],
         )
 
     def random_dihedral_augment(self, imageA, imageB):
